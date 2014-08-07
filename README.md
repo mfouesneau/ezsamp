@@ -5,13 +5,18 @@ This class aimed at providing a very small VO interactivity using the SAMP
 protocol. This allows anyone to easily send and receive data to VO applications
 such as Aladin or Topcat.
 
-It provides 2 Classes:
+It provides 3 Classes:
 
 * Hub:
     Samp hub that is required to manage the communications between all the VO applications
 
 * Client:
     Python object that is a proxy to send and receive data from/to applications
+
+* SimpleTable:
+    a fallback class of eztables that allows users to easily manipulate tables
+    (see optional dependencies)
+    
 
 Requirements
 ------------
