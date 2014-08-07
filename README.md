@@ -3,7 +3,7 @@ SAMPy Client package
 
 This class aimed at providing a very small VO interactivity using the SAMP
 protocol. This allows anyone to easily send and receive data to VO applications
-such as Aladin or Topcat.
+such as Aladin, Topcat or DS9.
 
 It provides 3 Classes:
 
