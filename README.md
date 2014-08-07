@@ -44,6 +44,6 @@ y = x ** 2
 # broadcast a table to topcat
 c['t0'] = {'x':x, 'y':y }
 
-if client is None:
-return c
+# if you have a VO app that broadcasted a table 'test'
+t = c['test']
 ```
