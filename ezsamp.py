@@ -6,13 +6,18 @@ This class aimed at providing a very small VO interactivity using the SAMP
 protocol. This allows anyone to easily send and receive data to VO applications
 such as Aladin or Topcat.
 
-It provides 2 Classes:
+It provides 3 Classes:
 
 * Hub:
-    Samp hub that is required to manage the communications between all the VO applications
+    Samp hub that is required to manage the communications between all the VO applicati
+ons
 
 * Client:
     Python object that is a proxy to send and receive data from/to applications
+
+* SimpleTable:
+    a fallback class of eztables that allows users to easily manipulate tables
+    (see optional dependencies)
 
 Requirements
 ------------
@@ -61,8 +66,15 @@ import numpy as np
 from numpy.lib import recfunctions
 from copy import deepcopy
 
-from astropy.vo import samp as sampy
-from astropy.io import fits as pyfits
+try:
+    from astropy.vo import samp as sampy
+except ImportError:
+    from . import sampy
+
+try:
+    from astropy.io import fits as pyfits
+except ImportError:
+    import pyfits
 
 # ================================================================
 # Python 3 compatibility behavior
@@ -92,7 +104,7 @@ class SimpleTable(object):
 
         if (type(fname) == dict) or (dtype in [dict, 'dict']):
             self.header = fname.pop('header', {})
-            self.data = self.convert_dict_to_structured_ndarray(fname)
+            self.data = self._convert_dict_to_structured_ndarray(fname)
         elif type(fname) in [str]:
             extension = fname.split('.')[-1]
             if (extension == 'csv') or dtype == 'csv':
@@ -111,6 +123,8 @@ class SimpleTable(object):
             self.header = fname.header
         else:
             raise Exception('Type {0!s:s} not handled'.format(type(fname)))
+        if 'NAME' not in self.header:
+            self.header['NAME'] = 'No Name'
 
     def write(self, fname, **kwargs):
         extension = fname.split('.')[-1]
@@ -511,7 +525,10 @@ class SimpleTable(object):
                     if k in tab.keys():
                         tab.delCol(k)
 
-        tab.header['COMMENT'] = 'SELECT %s FROM %s WHERE %s' % (','.join(_fields), self.header['NAME'], condition)
+        comm = 'SELECT {0:s} FROM {1:s} WHERE {2:s}'
+        tab.header['COMMENT'] = comm.format(','.join(_fields),
+                                            self.header['NAME'],
+                                            condition)
         return tab
 
 
