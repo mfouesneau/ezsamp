@@ -95,12 +95,14 @@ else:
     itervalues = operator.methodcaller('itervalues')
 
 
-#==========================================================================
+# ==========================================================================
 # SimpleTable -- provides table manipulations with limited storage formats
-#==========================================================================
+# ==========================================================================
 class SimpleTable(object):
 
-    def __init__(self, fname, dtype=None, **kwargs):
+    def __init__(self, fname, *args, **kwargs):
+
+        dtype = kwargs.pop('dtype', None)
 
         if (type(fname) == dict) or (dtype in [dict, 'dict']):
             self.header = fname.pop('header', {})
@@ -108,15 +110,18 @@ class SimpleTable(object):
         elif type(fname) in [str]:
             extension = fname.split('.')[-1]
             if (extension == 'csv') or dtype == 'csv':
-                self.data = np.recfromcsv(fname, **kwargs)
+                self.data = np.recfromcsv(fname, *args, **kwargs)
                 self.header = {}
             elif (extension == 'fits') or dtype == 'fits':
-                self.data = np.array(pyfits.getdata(fname, **kwargs))
-                self.header = pyfits.getheader(fname, ext=1, **kwargs)
+                self.data = np.array(pyfits.getdata(fname, *args, **kwargs))
+                self.header = pyfits.getheader(fname, *args, **kwargs)
             else:
                 raise Exception('Format {0:s} not handled'.format(extension))
         elif type(fname) == np.ndarray:
             self.data = fname
+            self.header = {}
+        elif type(fname) == pyfits.FITS_rec:
+            self.data = np.array(fname)
             self.header = {}
         elif type(fname) == SimpleTable:
             self.data = fname.data
@@ -516,7 +521,7 @@ class SimpleTable(object):
             else:
                 tab.data = self.data[_fields]
             names = tab.data.dtype.names
-            #cleanup aliases and columns
+            # cleanup aliases and columns
             for k in self.keys():
                 if k not in names:
                     al = self.reverse_alias(k)
@@ -540,9 +545,9 @@ except Exception as e:
     Table = SimpleTable
 
 
-#==========================================================================
+# ==========================================================================
 # HUB -- Generate a SAMP hub to manage communications
-#==========================================================================
+# ==========================================================================
 class Hub(object):
     """
     This class is a very minimalistic class that provides a working SAMP hub
@@ -561,9 +566,9 @@ class Hub(object):
         self.SAMPHubServer.stop()
 
 
-#==========================================================================
+# ==========================================================================
 # Client -- Generate a SAMP client able to send and receive data
-#==========================================================================
+# ==========================================================================
 class Client(object):
     """
     This class implenent an interface to SAMP applications like Topcat and
@@ -584,13 +589,13 @@ class Client(object):
     (broadcast the table from Topcat)
     >>> table = client['tblName']
     """
-    #Destructor ===============================================================
+    # Destructor ===============================================================
     def __del__(self):
         self.client.disconnect()
         if self.hub is not None:
             self.hub.stop()
 
-    #Constructor ==============================================================
+    # Constructor ==============================================================
     def __init__(self, addr='localhost', hub=True):
         # Before we start, let's kill off any zombies
 
@@ -818,8 +823,8 @@ class Client(object):
                 print('TOPCAT tells us that row %s of file %s was highlighted!' % (row, filename))
 
 
-#==========================================================================
-#==========================================================================
+# ==========================================================================
+# ==========================================================================
 def demo(client=None):
     """
     This function is a short example of how to use this package
