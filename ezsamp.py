@@ -113,6 +113,8 @@ class SimpleTable(object):
                 self.data = np.recfromcsv(fname, *args, **kwargs)
                 self.header = {}
             elif (extension == 'fits') or dtype == 'fits':
+                if ('extname' not in kwargs) and ('ext' not in kwargs) and (len(args) == 0):
+                    args = (1, )
                 self.data = np.array(pyfits.getdata(fname, *args, **kwargs))
                 self.header = pyfits.getheader(fname, *args, **kwargs)
             else:
