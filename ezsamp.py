@@ -103,6 +103,7 @@ class SimpleTable(object):
     def __init__(self, fname, *args, **kwargs):
 
         dtype = kwargs.pop('dtype', None)
+        self._aliases = {}
 
         if (type(fname) == dict) or (dtype in [dict, 'dict']):
             self.header = fname.pop('header', {})
@@ -126,8 +127,13 @@ class SimpleTable(object):
             self.data = np.array(fname)
             self.header = {}
         elif type(fname) == SimpleTable:
-            self.data = fname.data
-            self.header = fname.header
+            cp = kwargs.pop('copy', True)
+            if cp:
+                self.data = deepcopy(fname.data)
+                self.header = deepcopy(fname.header)
+            else:
+                self.data = fname.data
+                self.header = fname.header
         else:
             raise Exception('Type {0!s:s} not handled'.format(type(fname)))
         if 'NAME' not in self.header:
@@ -140,7 +146,8 @@ class SimpleTable(object):
         elif (extension in ['txt', 'dat']):
             np.savetxt(fname, self.data, delimiter=' ', header=self.header, **kwargs)
         elif (extension == 'fits'):
-            pyfits.writeto(fname, self.data, self.header, **kwargs)
+            pyfits.writeto(fname, self.data, pyfits.Header(self.header.items()),
+                           **kwargs)
         else:
             raise Exception('Format {0:s} not handled'.format(extension))
 
@@ -158,23 +165,7 @@ class SimpleTable(object):
         tab: structured ndarray
             structured numpy array
         """
-        newdtype = []
-        for key, dk in iteritems(data):
-            _dk = np.asarray(dk)
-            dtype = _dk.dtype
-            # unknown type is converted to text
-            if dtype.type == np.object_:
-                if len(data) == 0:
-                    longest = 0
-                else:
-                    longest = len(max(_dk, key=len))
-                    _dk = _dk.astype('|%iS' % longest)
-            if _dk.ndim > 1:
-                newdtype.append((str(key), _dk.dtype, (_dk.shape[1],)))
-            else:
-                newdtype.append((str(key), _dk.dtype))
-        tab = np.rec.fromarrays(itervalues(data), dtype=newdtype)
-        return tab
+        return convert_dict_to_structured_ndarray(data)
 
     def keys(self):
         return self.colnames
@@ -279,7 +270,8 @@ class SimpleTable(object):
         """
         if not hasattr(r, 'data'):
             raise AttributeError('r should be a Table object')
-        self.data = recfunctions.stack_arrays( [self.data, r.data], defaults, usemask=False, asrecarray=True)
+        self.data = recfunctions.stack_arrays([self.data, r.data], defaults,
+                                              usemask=False, asrecarray=True)
 
     def join_by(self, r2, key, jointype='inner', r1postfix='1', r2postfix='2',
                 defaults=None, asrecarray=False, asTable=True):
@@ -402,9 +394,9 @@ class SimpleTable(object):
         return p
 
     def find_duplicate(self, index_only=False, values_only=False):
-        """Find duplication in the table entries, return a list of duplicated elements
-            Only works at this time is 2 lines are *the same entry*
-            not if 2 lines have *the same values*
+        """Find duplication in the table entries, return a list of duplicated
+        elements Only works at this time is 2 lines are *the same entry* not if
+        2 lines have *the same values*
         """
         dup = []
         idd = []
@@ -478,6 +470,33 @@ class SimpleTable(object):
         ind = np.where(self.evalexpr(condition, condvars, dtype=bool ), *args, **kwargs)
         return ind
 
+    def select(self, fields, indices=None, **kwargs):
+        """
+        Select only a few fields in the table
+        """
+        if fields.count(',') > 0:
+            _fields = fields.split(',')
+        elif fields.count(' ') > 0:
+            _fields = fields.split()
+        else:
+            _fields = fields
+
+        if _fields == '*':
+            return self
+        else:
+            d = {}
+            for k in _fields:
+                if indices is not None:
+                    d[k] = self[k][indices]
+                else:
+                    d[k] = self[k]
+            d['header'] = deepcopy(self.header)
+            tab = self.__class__(d)
+            for k in self.__dict__.keys():
+                if k not in ('data', ):
+                    setattr(tab, k, deepcopy(self.__dict__[k]))
+            return tab
+
     def selectWhere(self, fields, condition, condvars=None, **kwargs):
         """ Read table data fulfilling the given `condition`.
             Only the rows fulfilling the `condition` are included in the result.
@@ -494,49 +513,47 @@ class SimpleTable(object):
         Returns
         -------
         """
-        # make a copy without the data itself (memory gentle)
-        tab = self.__class__()
-        for k in self.__dict__.keys():
-            if k != 'data':
-                setattr(tab, k, deepcopy(self.__dict__[k]))
-
-        if fields.count(',') > 0:
-            _fields = fields.split(',')
-        elif fields.count(' ') > 0:
-            _fields = fields.split()
-        else:
-            _fields = fields
-
         if condition in [True, 'True', None]:
             ind = None
         else:
             ind = self.where(condition, condvars, **kwargs)
 
-        if _fields == '*':
-            if ind is not None:
-                tab.data = self.data[ind]
-            else:
-                tab.data = deepcopy(self.data)
-        else:
-            if ind is not None:
-                tab.data = self.data[_fields][ind]
-            else:
-                tab.data = self.data[_fields]
-            names = tab.data.dtype.names
-            # cleanup aliases and columns
-            for k in self.keys():
-                if k not in names:
-                    al = self.reverse_alias(k)
-                    for alk in al:
-                        tab.delCol(alk)
-                    if k in tab.keys():
-                        tab.delCol(k)
+        tab = self.select(fields, indices=ind)
 
-        comm = 'SELECT {0:s} FROM {1:s} WHERE {2:s}'
-        tab.header['COMMENT'] = comm.format(','.join(_fields),
-                                            self.header['NAME'],
-                                            condition)
         return tab
+
+
+def convert_dict_to_structured_ndarray(data):
+    """convert_dict_to_structured_ndarray
+
+    Parameters
+    ----------
+
+    data: dictionary like object
+        data structure which provides iteritems and itervalues
+
+    returns
+    -------
+    tab: structured ndarray
+        structured numpy array
+    """
+    newdtype = []
+    for key, dk in iteritems(data):
+        _dk = np.atleast_1d(np.asarray(dk))
+        dtype = _dk.dtype
+        # unknown type is converted to text
+        if dtype.type == np.object_:
+            if len(data) == 0:
+                longest = 0
+            else:
+                longest = len(max(_dk.astype(str), key=len))
+                _dk = _dk.astype('|%iS' % longest)
+        if _dk.ndim > 1:
+            newdtype.append((str(key), _dk.dtype, (_dk.shape[1],)))
+        else:
+            newdtype.append((str(key), _dk.dtype))
+    tab = np.rec.fromarrays(itervalues(data), dtype=newdtype)
+    return tab
 
 
 try:
