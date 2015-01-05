@@ -280,7 +280,7 @@ class Client(object):
         if Table != SimpleTable:
             kwargs['append'] = False
 
-        if isinstance(data, Table):
+        if isinstance(data, (Table, SimpleTable)):
             data.write(k, **kwargs)
             tab = data
         else:
