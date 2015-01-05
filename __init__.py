@@ -1,1 +1,1 @@
-from .ezsamp import SimpleTable, Client, Hub
+from .ezsamp import SimpleTable, Client, Hub, Table
