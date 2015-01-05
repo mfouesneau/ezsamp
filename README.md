@@ -5,6 +5,8 @@ This class aimed at providing a very small VO interactivity using the SAMP
 protocol. This allows anyone to easily send and receive data to VO applications
 such as Aladin, Topcat or DS9.
 
+Tested with python 2.7 and python 3.4
+
 It provides 3 Classes:
 
 * Hub:
