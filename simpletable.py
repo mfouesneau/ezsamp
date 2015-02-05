@@ -3,26 +3,61 @@
 
 Requirements
 ------------
-* astropy:
-    provides a replacement to pyfits
 
-.. note::
+* FIT format:
+    * astropy:
+        provides a replacement to pyfits
+        pyfits can still be used instead but astropy is now the default
 
-    pyfits can still be used instead but astropy is now the default
+* HDF5 format:
+    * pytables
+
+RuntimeError will be raised when writing to a format associated with missing
+package.
+
+
+.. code-block::python
+
+    >>> t = SimpleTable('path/mytable.csv')
+    # get a subset of columns only
+    >>> s = t.get('M_* logTe logLo U B V I J K')
+    # set some aliases
+    >>> t.set_alias('logT', 'logTe')
+    >>> t.set_alias('logL', 'logLLo')
+    # make a query on one or multiple column
+    >>> q = s.selectWhere('logT logL', '(J > 2) & (10 ** logT > 5000)')
+    # q is also a table object
+    >>> q.plot('logT', 'logL', ',')
+    # makes a simple plot
+    >>> s.write('newtable.fits')
+    # export the initial subtable to a new file
 """
 from __future__ import (absolute_import, division, print_function)
 
-__version__ = '2.0'
+__version__ = '3.0'
+__all__ = ['AstroHelpers', 'AstroTable', 'SimpleTable', 'stats']
 
 import sys
-import numpy as np
-from numpy.lib import recfunctions
+import math
 from copy import deepcopy
+import re
+import itertools
+from functools import wraps, partial
+import numpy as np
+from numpy import deg2rad, rad2deg, sin, cos, sqrt, arcsin, arctan2
+from numpy.lib import recfunctions
 
 try:
     from astropy.io import fits as pyfits
 except ImportError:
     import pyfits
+except:
+    pyfits = None
+
+try:
+    import tables
+except ImportError:
+    tables = None
 
 # ==============================================================================
 # Python 3 compatibility behavior
@@ -452,8 +487,185 @@ def _ascii_read_header(fname, comments='#', delimiter=None, commentedHeader=True
 
     if not hasattr(fname, 'read'):
         stream.close()
+    else:
+        stream.seek(stream.tell() - len(line))
+        nlines = 0  # make sure the value is set to the current position
 
     return nlines, header, units, desc, alias, names
+
+
+def _hdf5_write_data(filename, data, tablename=None, mode='w', append=False,
+                     header={}, units={}, comments={}, aliases={}, **kwargs):
+    """ Write table into HDF format
+
+    Parameters
+    ----------
+    filename : file path, or tables.File instance
+        File to write to.  If opened, must be opened and writable (mode='w' or 'a')
+
+    data: recarray
+        data to write to the new file
+
+    tablename: str
+        path of the node including table's name
+
+    mode: str
+        in ('w', 'a') mode to open the file
+
+    append: bool
+        if set, tends to append data to an existing table
+
+    header: dict
+        table header
+
+    units: dict
+        dictionary of units
+
+    alias: dict
+        aliases
+
+    comments: dict
+        comments/description of keywords
+
+    .. note::
+        other keywords are forwarded to :func:`tables.openFile`
+    """
+
+    if hasattr(filename, 'read'):
+        raise Exception("HDF backend does not implement stream")
+
+    if append is True:
+        mode = 'a'
+
+    if isinstance(filename, tables.File):
+        if (filename.mode != mode) & (mode != 'r'):
+            raise tables.FileModeError('The file is already opened in a different mode')
+        hd5 = filename
+    else:
+        hd5 = tables.openFile(filename, mode=mode)
+
+    # check table name and path
+    tablename = tablename or header.get('NAME', None)
+    if tablename in ('', None, 'Noname', 'None'):
+        tablename = '/data'
+
+    w = tablename.split('/')
+    where = '/'.join(w[:-1])
+    name = w[-1]
+    if where in ('', None):
+        where = '/'
+    if where[0] != '/':
+        where = '/' + where
+
+    if append:
+        try:
+            t = hd5.getNode(where + name)
+            t.append(data.astype(t.description._v_dtype))
+            t.flush()
+        except tables.NoSuchNodeError:
+            print(("Warning: Table {0} does not exists.  \n A new table will be created").format(where + name))
+            append = False
+
+    if not append:
+        t = hd5.createTable(where, name, data, **kwargs)
+
+        # update header
+        for k, v in header.items():
+            if (k == 'FILTERS') & (float(t.attrs['VERSION']) >= 2.0):
+                t.attrs[k.lower()] = v
+            else:
+                t.attrs[k] = v
+        if 'TITLE' not in header:
+            t.attrs['TITLE'] = name
+
+        # add column descriptions and units
+        for e, colname in enumerate(data.dtype.names):
+            _u = units.get(colname, None)
+            _d = comments.get(colname, None)
+            if _u is not None:
+                t.attrs['FIELD_{0:d}_UNIT'] = _u
+            if _d is not None:
+                t.attrs['FIELD_{0:d}_DESC'] = _d
+
+        # add aliases
+        for i, (k, v) in enumerate(aliases.items()):
+            t.attrs['ALIAS{0:d}'.format(i)] = '{0:s}={1:s}'.format(k, v)
+
+        t.flush()
+
+    if not isinstance(filename, tables.File):
+        hd5.flush()
+        hd5.close()
+
+
+def _hdf5_read_data(filename, tablename=None, silent=False, *args, **kwargs):
+    """ Generate the corresponding ascii Header that contains all necessary info
+
+    Parameters
+    ----------
+    filename: str
+        file to read from
+
+    tablename: str
+        node containing the table
+
+    silent: bool
+        skip verbose messages
+
+    Returns
+    -------
+    hdr: str
+        string that will be be written at the beginning of the file
+    """
+    source = tables.openFile(filename, *args, **kwargs)
+
+    if tablename is None:
+        node = source.listNodes('/')[0]
+        tablename = node.name
+    else:
+        if tablename[0] != '/':
+            node = source.getNode('/' + tablename)
+        else:
+            node = source.getNode(tablename)
+    if not silent:
+        print("\tLoading table: {0}".format(tablename))
+
+    hdr = {}
+    aliases = {}
+
+    # read header
+    exclude = ['NROWS', 'VERSION', 'CLASS', 'EXTNAME', 'TITLE']
+    for k in node.attrs._v_attrnames:
+        if (k not in exclude):
+            if (k[:5] != 'FIELD') & (k[:5] != 'ALIAS'):
+                hdr[k] = node.attrs[k]
+            elif k[:5] == 'ALIAS':
+                c0, c1 = node.attrs[k].split('=')
+                aliases[c0] = c1
+
+    empty_name = ['', 'None', 'Noname', None]
+    if node.attrs['TITLE'] not in empty_name:
+        hdr['NAME'] = node.attrs['TITLE']
+    else:
+        hdr['NAME'] = '{0:s}/{1:s}'.format(filename, node.name)
+
+    # read column meta
+    units = {}
+    desc = {}
+
+    for (k, colname) in enumerate(node.colnames):
+        _u = getattr(node.attrs, 'FIELD_{0:d}_UNIT'.format(k), None)
+        _d = getattr(node.attrs, 'FIELD_{0:d}_DESC'.format(k), None)
+        if _u is not None:
+            units[colname] = _u
+        if _d is not None:
+            desc[colname] = _d
+
+    data = node[:]
+
+    source.close()
+
+    return hdr, aliases, units, desc, data
 
 
 def _ascii_generate_header(tab, comments='#', delimiter=' ',
@@ -519,6 +731,57 @@ def _ascii_generate_header(tab, comments='#', delimiter=' ',
     return '\n'.join(hdr)
 
 
+def _latex_writeto(filename, tab, comments='%'):
+    """ Write the data into a latex table format
+
+    Parameters
+    ----------
+    filename: str
+        file or unit to write into
+
+    tab: SimpleTable instance
+        table
+
+    comments: str
+        string to prepend header lines
+
+    delimiter: str, optional
+        The string used to separate values.  By default, this is any
+        whitespace.
+
+    commentedHeader: bool, optional
+        if set, the last line of the header is expected to be the column titles
+    """
+    txt = "\\begin{table}\n\\begin{center}\n"
+
+    # add caption
+    tabname = tab.header.get('NAME', None)
+    if tabname not in ['', None, 'None']:
+        txt += "\\caption{{{0:s}}}\n".format(tabname)
+
+    # tabular
+    txt += '\\begin{{tabular}}{{{0:s}}}\n'.format('c' * tab.ncols)
+    txt += tab.pprint(delim=' & ', fields='MAG*', headerChar='', endline='\\\\\n', all=True, ret=True)
+    txt += '\\end{tabular}\n'
+
+    # end table
+    txt += "\\end{center}\n"
+
+    # add notes if any
+    if len(tab._desc) > 0:
+        txt += '\% notes \n\\begin{scriptsize}\n'
+        for e, (k, v) in enumerate(tab._desc.items()):
+            if v not in (None, 'None', 'none', ''):
+                txt += '{0:d} {1:s}: {2:s} \\\\\n'.format(e, k, v)
+        txt += '\\end{scriptsize}\n'
+    txt += "\\end{table}\n"
+    if hasattr(filename, 'write'):
+        filename.write(txt)
+    else:
+        with open(filename, 'w') as unit:
+            unit.write(txt)
+
+
 def _convert_dict_to_structured_ndarray(data):
     """convert_dict_to_structured_ndarray
 
@@ -552,10 +815,528 @@ def _convert_dict_to_structured_ndarray(data):
     return tab
 
 
+def __indent__(rows, header=None, units=None, headerChar='-',
+               delim=' | ', endline='\n', **kwargs):
+    """Indents a table by column.
+
+    Parameters
+    ----------
+    rows: sequences of rows
+        one sequence per row.
+
+    header: sequence of str
+        row consists of the columns' names
+
+    units: sequence of str
+        Sequence of units
+
+    headerChar: char
+        Character to be used for the row separator line
+
+    delim: char
+        The column delimiter.
+
+    returns
+    -------
+    txt: str
+        string represation of rows
+    """
+    length_data = list(map(max, zip(*[list(map(len, k)) for k in rows])))
+    length = length_data[:]
+
+    if (header is not None):
+        length_header = list(map(len, header))
+        length = list(map(max, zip(length_data, length_header)))
+
+    if (units is not None):
+        length_units = list(map(len, units))
+        length = list(map(max, zip(length_data, length_units)))
+
+    if headerChar not in (None, '', ' '):
+        rowSeparator = headerChar * (sum(length) + len(delim) * (len(length) - 1)) + endline
+    else:
+        rowSeparator = ''
+
+    # make the format
+    fmt = ['{{{0:d}:{1:d}s}}'.format(k, l) for (k, l) in enumerate(length)]
+    fmt = delim.join(fmt) + endline
+    # write the string
+    txt = rowSeparator
+    if header is not None:
+        txt += fmt.format(*header)  # + endline
+        txt += rowSeparator
+    if units is not None:
+        txt += fmt.format(*units)  # + endline
+        txt += rowSeparator
+    for r in rows:
+        txt += fmt.format(*r)  # + endline
+    txt += rowSeparator
+    return txt
+
+
+def pprint_rec_entry(data, num=0, keys=None):
+        """ print one line with key and values properly to be readable
+
+        Parameters
+        ----------
+        data: recarray
+            data to extract entry from
+
+        num: int, slice
+            indice selection
+
+        keys: sequence or str
+            if str, can be a regular expression
+            if sequence, the sequence of keys to print
+        """
+        if (keys is None) or (keys == '*'):
+            _keys = data.dtype.names
+        elif type(keys) in basestring:
+            _keys = [k for k in data.dtype.names if (re.match(keys, k) is not None)]
+        else:
+            _keys = keys
+
+        length = max(map(len, _keys))
+        fmt = '{{0:{0:d}s}}: {{1}}'.format(length)
+        data = data[num]
+
+        for k in _keys:
+            print(fmt.format(k, data[k]))
+
+
+def pprint_rec_array(data, idx=None, fields=None, ret=False, all=False,
+                     headerChar='-', delim=' | ', endline='\n' ):
+        """ Pretty print the table content
+            you can select the table parts to display using idx to
+            select the rows and fields to only display some columns
+            (ret is only for insternal use)
+
+        Parameters
+        ----------
+        data: array
+            array to show
+
+        idx: sequence, slide
+            sub selection to print
+
+        fields: str, sequence
+            if str can be a regular expression, and/or list of fields separated
+            by spaces or commas
+
+        ret: bool
+            if set return the string representation instead of printing the result
+
+        all: bool
+            if set, force to show all rows
+
+        headerChar: char
+            Character to be used for the row separator line
+
+        delim: char
+            The column delimiter.
+        """
+        if (fields is None) or (fields == '*'):
+            _keys = data.dtype.names
+        elif type(fields) in basestring:
+            if ',' in fields:
+                _fields = fields.split(',')
+            elif ' ' in fields:
+                _fields = fields.split()
+            else:
+                _fields = [fields]
+            lbls = data.dtype.names
+            _keys = []
+            for _fk in _fields:
+                _keys += [k for k in lbls if (re.match(_fk, k) is not None)]
+        else:
+            lbls = data.dtype.names
+            _keys = []
+            for _fk in _fields:
+                _keys += [k for k in lbls if (re.match(_fk, k) is not None)]
+
+        nfields = len(_keys)
+        nrows = len(data)
+        fields = list(_keys)
+
+        if idx is None:
+            if (nrows < 10) or (all is True):
+                rows = [ [ str(data[k][rk]) for k in _keys ] for rk in range(nrows)]
+            else:
+                _idx = range(6)
+                rows = [ [ str(data[k][rk]) for k in _keys ] for rk in range(5) ]
+                if nfields > 1:
+                    rows += [ ['...' for k in range(nfields) ] ]
+                else:
+                    rows += [ ['...' for k in range(nfields) ] ]
+                rows += [ [ str(data[k][rk]) for k in fields ] for rk in range(-5, 0)]
+        elif isinstance(idx, slice):
+            _idx = range(idx.start, idx.stop, idx.step or 1)
+            rows = [ [ str(data[k][rk]) for k in fields ] for rk in _idx]
+        else:
+            rows = [ [ str(data[k][rk]) for k in fields ] for rk in idx]
+
+        out = __indent__(rows, header=_keys, units=None, delim=delim,
+                         headerChar=headerChar, endline=endline)
+        if ret is True:
+            return out
+        else:
+            print(out)
+
+
+def elementwise(func):
+    """
+    Quick and dirty elementwise function decorator it provides a quick way
+    to apply a function either on one element or a sequence of elements
+    """
+    @wraps(func)
+    def wrapper(it, **kwargs):
+        if hasattr(it, '__iter__') & (type(it) not in basestring):
+            _f = partial(func, **kwargs)
+            return map(_f, it)
+        else:
+            return func(it, **kwargs)
+    return wrapper
+
+
+class AstroHelpers(object):
+    """ Helpers related to astronomy data """
+
+    @staticmethod
+    @elementwise
+    def hms2deg(_str, delim=':'):
+        """ Convert hex coordinates into degrees
+
+        Parameters
+        ----------
+        str: string or sequence
+            string to convert
+
+        delimiter: str
+            character delimiting the fields
+
+        Returns
+        -------
+        deg: float
+            angle in degrees
+        """
+        if _str[0] == '-':
+            neg = -1
+            _str = _str[1:]
+        else:
+            neg = 1
+        _str = _str.split(delim)
+        return neg * ((((float(_str[-1]) / 60. +
+                         float(_str[1])) / 60. +
+                        float(_str[0])) / 24. * 360.))
+
+    @staticmethod
+    @elementwise
+    def deg2dms(val, delim=':'):
+        """ Convert degrees into hex coordinates
+        Parameters
+        ----------
+        deg: float
+            angle in degrees
+
+        delimiter: str
+            character delimiting the fields
+
+        Returns
+        -------
+        str: string or sequence
+            string to convert
+        """
+        if val < 0:
+            sign = -1
+        else:
+            sign = 1
+        d = int( sign * val )
+        m = int( (sign * val - d) * 60. )
+        s = (( sign * val - d) * 60.  - m) * 60.
+        return '{0}{1}{2}{3}{4}'.format( sign * d, delim, m, delim, s)
+
+    @staticmethod
+    @elementwise
+    def deg2hms(val, delim=':'):
+        """ Convert degrees into hex coordinates
+
+        Parameters
+        ----------
+        deg: float
+            angle in degrees
+
+        delimiter: str
+            character delimiting the fields
+
+        Returns
+        -------
+        str: string or sequence
+            string to convert
+        """
+        if val < 0:
+            sign = -1
+        else:
+            sign = 1
+        h = int( sign * val / 45. * 3.)   # * 24 / 360
+        m = int( (sign * val / 45. * 3. - h) * 60. )
+        s = (( sign * val / 45. * 3. - h) * 60.  - m) * 60.
+        return '{0}{1}{2}{3}{4}'.format( sign * h, delim, m, delim, s)
+
+    @staticmethod
+    @elementwise
+    def dms2deg(_str, delim=':'):
+        """ Convert hex coordinates into degrees
+        Parameters
+        ----------
+        str: string or sequence
+            string to convert
+
+        delimiter: str
+            character delimiting the fields
+
+        Returns
+        -------
+        deg: float
+            angle in degrees
+        """
+        if _str[0] == '-':
+            neg = -1
+            _str = _str[1:]
+        else:
+            neg = 1
+        _str = _str.split(delim)
+        return (neg * ((float(_str[-1]) / 60. + float(_str[1])) / 60. + float(_str[0])))
+
+    @staticmethod
+    @elementwise
+    def euler(ai_in, bi_in, select, b1950=False, dtype='f8'):
+        """
+        Transform between Galactic, celestial, and ecliptic coordinates.
+        Celestial coordinates (RA, Dec) should be given in equinox J2000
+        unless the b1950 is True.
+
+        select From           To         |   select    From          To
+        ----------------------------------------------------------------------
+        1      RA-Dec (2000)  Galactic   |     4       Ecliptic      RA-Dec
+        2      Galactic       RA-DEC     |     5       Ecliptic      Galactic
+        3      RA-Dec         Ecliptic   |     6       Galactic      Ecliptic
+
+        Parameters
+        ----------
+
+        long_in: float, or sequence
+            Input Longitude in DEGREES, scalar or vector.
+
+        lat_in: float, or sequence
+            Latitude in DEGREES
+
+        select: int
+            Integer from 1 to 6 specifying type of coordinate transformation.
+
+        b1950: bool
+            set equinox set to 1950
+
+
+        Returns
+        -------
+        long_out: float, seq
+            Output Longitude in DEGREES
+
+        lat_out: float, seq
+            Output Latitude in DEGREES
+
+
+        REVISION HISTORY:
+        Written W. Landsman,  February 1987
+        Adapted from Fortran by Daryl Yentis NRL
+        Converted to IDL V5.0   W. Landsman   September 1997
+        Made J2000 the default, added /FK4 keyword  W. Landsman December 1998
+        Add option to specify SELECT as a keyword W. Landsman March 2003
+        Converted from IDL to numerical Python: Erin Sheldon, NYU, 2008-07-02
+        """
+
+        # Make a copy as an array. ndmin=1 to avoid messed up scalar arrays
+        ai = np.array(ai_in, ndmin=1, copy=True, dtype=dtype)
+        bi = np.array(bi_in, ndmin=1, copy=True, dtype=dtype)
+
+        PI = math.pi
+        # HALFPI = PI / 2.0
+        D2R = PI / 180.0
+        R2D = 1.0 / D2R
+
+        twopi   = 2.0 * PI
+        fourpi  = 4.0 * PI
+
+        #   J2000 coordinate conversions are based on the following constants
+        #   (see the Hipparcos explanatory supplement).
+        #  eps = 23.4392911111d           Obliquity of the ecliptic
+        #  alphaG = 192.85948d            Right Ascension of Galactic North Pole
+        #  deltaG = 27.12825d             Declination of Galactic North Pole
+        #  lomega = 32.93192d             Galactic longitude of celestial equator
+        #  alphaE = 180.02322d            Ecliptic longitude of Galactic North Pole
+        #  deltaE = 29.811438523d         Ecliptic latitude of Galactic North Pole
+        #  Eomega  = 6.3839743d           Galactic longitude of ecliptic equator
+        # Parameters for all the different conversions
+        if b1950:
+            # equinox = '(B1950)'
+            psi    = np.array([ 0.57595865315, 4.9261918136,
+                                0.00000000000, 0.0000000000,
+                                0.11129056012, 4.7005372834], dtype=dtype)
+            stheta = np.array([ 0.88781538514, -0.88781538514,
+                                0.39788119938, -0.39788119938,
+                                0.86766174755, -0.86766174755], dtype=dtype)
+            ctheta = np.array([ 0.46019978478, 0.46019978478,
+                                0.91743694670, 0.91743694670,
+                                0.49715499774, 0.49715499774], dtype=dtype)
+            phi    = np.array([ 4.9261918136,  0.57595865315,
+                                0.0000000000, 0.00000000000,
+                                4.7005372834, 0.11129056012], dtype=dtype)
+        else:
+            # equinox = '(J2000)'
+            psi    = np.array([ 0.57477043300, 4.9368292465,
+                                0.00000000000, 0.0000000000,
+                                0.11142137093, 4.71279419371], dtype=dtype)
+            stheta = np.array([ 0.88998808748, -0.88998808748,
+                                0.39777715593, -0.39777715593,
+                                0.86766622025, -0.86766622025], dtype=dtype)
+            ctheta = np.array([ 0.45598377618, 0.45598377618,
+                                0.91748206207, 0.91748206207,
+                                0.49714719172, 0.49714719172], dtype=dtype)
+            phi    = np.array([ 4.9368292465,  0.57477043300,
+                                0.0000000000, 0.00000000000,
+                                4.71279419371, 0.11142137093], dtype=dtype)
+
+        # zero offset
+        i  = select - 1
+        a  = ai * D2R - phi[i]
+
+        b = bi * D2R
+        sb = sin(b)
+        cb = cos(b)
+        cbsa = cb * sin(a)
+        b  = -stheta[i] * cbsa + ctheta[i] * sb
+        w, = np.where(b > 1.0)
+        if w.size > 0:
+            b[w] = 1.0
+        bo = arcsin(b) * R2D
+        a  = arctan2( ctheta[i] * cbsa + stheta[i] * sb, cb * cos(a) )
+        ao = ( (a + psi[i] + fourpi) % twopi) * R2D
+        return ao, bo
+
+    @staticmethod
+    def sphdist(ra1, dec1, ra2, dec2):
+        """measures the spherical distance between 2 points
+
+        Parameters
+        ----------
+        ra1: float or sequence
+            first right ascensions in degrees
+
+        dec1: float or sequence
+            first declination in degrees
+        ra2: float or sequence
+            second right ascensions in degrees
+        dec2: float or sequence
+            first declination in degrees
+
+        Returns
+        -------
+        Outputs: float or sequence
+            returns a distance in degrees
+        """
+        dec1_r = deg2rad(dec1)
+        dec2_r = deg2rad(dec2)
+        return 2. * rad2deg(arcsin(sqrt((sin((dec1_r - dec2_r) / 2)) ** 2 +
+                                        cos(dec1_r) * cos(dec2_r) * (
+                                            sin((deg2rad(ra1 - ra2)) / 2)) **
+                                        2)))
+
+    @staticmethod
+    def conesearch(ra0, dec0, ra, dec, r, outtype=0):
+        """ Perform a cone search on a table
+
+        Parameters
+        ----------
+        ra0: ndarray[ndim=1, dtype=float]
+            column name to use as RA source in degrees
+
+        dec0: ndarray[ndim=1, dtype=float]
+            column name to use as DEC source in degrees
+
+        ra: float
+            ra to look for (in degree)
+
+        dec: float
+            ra to look for (in degree)
+
+        r: float
+            distance in degrees
+
+        outtype: int
+            type of outputs
+                0 -- minimal, indices of matching coordinates
+                1 -- indices and distances of matching coordinates
+                2 -- full, boolean filter and distances
+
+        Returns
+        -------
+        t: tuple
+            if outtype is 0:
+                only return indices from ra0, dec0
+            elif outtype is 1:
+                return indices from ra0, dec0 and distances
+            elif outtype is 2:
+                return conditional vector and distance to all ra0, dec0
+        """
+        @elementwise
+        def getDist( pk ):
+            """ get spherical distance between 2 points """
+            return AstroHelpers.sphdist(pk[0], pk[1], ra, dec)
+
+        dist = np.array(list(getDist(zip(ra0, dec0))))
+        v = (dist <= r)
+
+        if outtype == 0:
+            return np.ravel(np.where(v))
+        elif outtype == 1:
+            return np.ravel(np.where(v)), dist[v]
+        else:
+            return v, dist
+
+
 # ==============================================================================
 # SimpleTable -- provides table manipulations with limited storage formats
 # ==============================================================================
 class SimpleTable(object):
+    """ Table class that is designed to be the basis of any format wrapping
+    around numpy recarrays
+
+    Attributes
+    ----------
+
+    fname: str or object
+        if str, the file to read from. This may be limited to the format
+        currently handled automatically. If the format is not correctly handled,
+        you can try by providing an object.__
+
+        if object with a structure like dict, ndarray, or recarray-like
+            the data will be encapsulated into a Table
+
+    caseless: bool
+        if set, column names will be caseless during operations
+
+    aliases: dict
+        set of column aliases (can be defined later :func:`set_alias`)
+
+    units: dict
+        set of column units (can be defined later :func:`set_unit`)
+
+    desc: dict
+        set of column description or comments (can be defined later :func:`set_comment`)
+
+    header: dict
+        key, value pair corresponding to the attributes of the table
+    """
 
     def __init__(self, fname, *args, **kwargs):
 
@@ -568,8 +1349,8 @@ class SimpleTable(object):
         if (type(fname) == dict) or (dtype in [dict, 'dict']):
             self.header = fname.pop('header', {})
             self.data = _convert_dict_to_structured_ndarray(fname)
-        elif (type(fname) in (str,)) or (dtype is not None):
-            if (type(fname) in (str,)):
+        elif (type(fname) in basestring) or (dtype is not None):
+            if (type(fname) in basestring):
                 extension = fname.split('.')[-1]
             else:
                 extension = None
@@ -579,6 +1360,7 @@ class SimpleTable(object):
                 commentedHeader = kwargs.pop('commentedHeader', False)
                 n, header, units, comments, aliases, names = _ascii_read_header(fname, commentedHeader=commentedHeader, **kwargs)
                 kwargs.setdefault('names', names)
+                kwargs.setdefault('skip_header', n)
                 self.data = np.recfromcsv(fname, *args, **kwargs)
                 self.header = header
                 self._units.update(**units)
@@ -591,12 +1373,15 @@ class SimpleTable(object):
                 commentedHeader = kwargs.pop('commentedHeader', True)
                 n, header, units, comments, aliases, names = _ascii_read_header(fname, commentedHeader=commentedHeader, **kwargs)
                 kwargs.setdefault('names', names)
+                kwargs.setdefault('skip_header', n)
                 self.data = np.recfromtxt(fname, *args, **kwargs)
                 self.header = header
                 self._units.update(**units)
                 self._desc.update(**comments)
                 self._aliases.update(**aliases)
             elif (extension == 'fits') or dtype == 'fits':
+                if pyfits is None:
+                    raise RuntimeError('Cannot read this format, Astropy or pyfits not found')
                 if ('extname' not in kwargs) and ('ext' not in kwargs) and (len(args) == 0):
                     args = (1, )
                 self.data = np.array(pyfits.getdata(fname, *args, **kwargs))
@@ -604,6 +1389,15 @@ class SimpleTable(object):
                 self.header = header
                 self._desc.update(**comments)
                 self._units.update(**units)
+                self._aliases.update(**aliases)
+            elif (extension in ('hdf5', 'hd5', 'hdf')) or dtype in (extension in ('hdf5', 'hd5', 'hdf')):
+                if tables is None:
+                    raise RuntimeError('Cannot read this format, pytables not found')
+                hdr, aliases, units, desc, data = _hdf5_read_data(fname, *args, **kwargs)
+                self.data = data
+                self.header = hdr
+                self._units.update(**units)
+                self._desc.update(**desc)
                 self._aliases.update(**aliases)
             else:
                 raise Exception('Format {0:s} not handled'.format(extension))
@@ -627,6 +1421,9 @@ class SimpleTable(object):
                 self._aliases = fname._aliases
                 self._units = fname._units
                 self._desc = fname._desc
+        elif hasattr(fname, 'dtype'):
+            self.data = np.array(fname)
+            self.header = {}
         else:
             raise Exception('Type {0!s:s} not handled'.format(type(fname)))
         if 'NAME' not in self.header:
@@ -634,6 +1431,120 @@ class SimpleTable(object):
                 self.header['NAME'] = 'No Name'
             else:
                 self.header['NAME'] = fname
+
+    def pprint_entry(self, num, keys=None):
+        """ print one line with key and values properly to be readable
+
+        Parameters
+        ----------
+        num: int, slice
+            indice selection
+
+        keys: sequence or str
+            if str, can be a regular expression
+            if sequence, the sequence of keys to print
+        """
+        if (keys is None) or (keys == '*'):
+            _keys = self.keys()
+        elif type(keys) in basestring:
+            _keys = [k for k in (self.keys() + tuple(self._aliases.keys()))
+                     if (re.match(keys, k) is not None)]
+        else:
+            _keys = keys
+
+        length = max(map(len, _keys))
+        fmt = '{{0:{0:d}s}}: {{1}}'.format(length)
+        data = self[num]
+
+        for k in _keys:
+            print(fmt.format(k, data[self.resolve_alias(k)]))
+
+    def pprint(self, idx=None, fields=None, ret=False, all=False,
+               full_match=False, headerChar='-', delim=' | ', endline='\n',
+               **kwargs):
+        """ Pretty print the table content
+            you can select the table parts to display using idx to
+            select the rows and fields to only display some columns
+            (ret is only for insternal use)
+
+        Parameters
+        ----------
+
+        idx: sequence, slide
+            sub selection to print
+
+        fields: str, sequence
+            if str can be a regular expression, and/or list of fields separated
+            by spaces or commas
+
+        ret: bool
+            if set return the string representation instead of printing the result
+
+        all: bool
+            if set, force to show all rows
+
+        headerChar: char
+            Character to be used for the row separator line
+
+        delim: char
+            The column delimiter.
+        """
+        if full_match is True:
+            fn = re.fullmatch
+        else:
+            fn = re.match
+
+        if (fields is None) or (fields == '*'):
+            _keys = self.keys()
+        elif type(fields) in basestring:
+            if ',' in fields:
+                _fields = fields.split(',')
+            elif ' ' in fields:
+                _fields = fields.split()
+            else:
+                _fields = [fields]
+            lbls = self.keys() + tuple(self._aliases.keys())
+            _keys = []
+            for _fk in _fields:
+                _keys += [k for k in lbls if (fn(_fk, k) is not None)]
+        else:
+            lbls = self.keys() + tuple(self._aliases.keys())
+            _keys = []
+            for _fk in _fields:
+                _keys += [k for k in lbls if (fn(_fk, k) is not None)]
+
+        nfields = len(_keys)
+
+        fields = list(map( self.resolve_alias, _keys ))
+
+        if idx is None:
+            if (self.nrows < 10) or all:
+                rows = [ [ str(self[k][rk]) for k in _keys ] for rk in range(self.nrows)]
+            else:
+                _idx = range(6)
+                rows = [ [ str(self[k][rk]) for k in _keys ] for rk in range(5) ]
+                if nfields > 1:
+                    rows += [ ['...' for k in range(nfields) ] ]
+                else:
+                    rows += [ ['...' for k in range(nfields) ] ]
+                rows += [ [ str(self[k][rk]) for k in fields ] for rk in range(-5, 0)]
+        elif isinstance(idx, slice):
+            _idx = range(idx.start, idx.stop, idx.step or 1)
+            rows = [ [ str(self[k][rk]) for k in fields ] for rk in _idx]
+        else:
+            rows = [ [ str(self[k][rk]) for k in fields ] for rk in idx]
+
+        if len(self._units) == 0:
+            units = None
+        else:
+            units = [ '(' + str( self._units.get(k, None) or '') + ')' for k in fields ]
+
+        out = __indent__(rows, header=_keys, units=units, delim=delim,
+                         headerChar=headerChar, endline=endline)
+        if ret is True:
+            return out
+        else:
+            print(out)
 
     def write(self, fname, **kwargs):
         """ write table into file
@@ -676,6 +1587,10 @@ class SimpleTable(object):
             else:
                 # patched version to correctly include the header
                 _fits_writeto(fname, self.data, hdr, **kwargs)
+        elif (extension in ('hdf', 'hdf5', 'hd5')):
+            _hdf5_write_data(fname, self.data, header=self.header,
+                             units=self._units, comments=self._desc,
+                             aliases=self._aliases, **kwargs)
         else:
             raise Exception('Format {0:s} not handled'.format(extension))
 
@@ -762,45 +1677,121 @@ class SimpleTable(object):
             for k, v in zip(colname, comment):
                 self._desc[self.resolve_alias(k)] = str(v)
 
-    def keys(self):
-        return self.colnames
+    def keys(self, regexp=None, full_match=False):
+        """
+        Return the data column names or a subset of it
+
+        Parameters
+        ----------
+        regexp: str
+            pattern to filter the keys with
+
+        full_match: bool
+            if set, use :func:`re.fullmatch` instead of :func:`re.match`
+
+        Try to apply the pattern at the start of the string, returning
+        a match object, or None if no match was found.
+
+        returns
+        -------
+        seq: sequence
+            sequence of keys
+        """
+        if (regexp is None) or (regexp == '*'):
+            return self.colnames
+        elif type(regexp) in basestring:
+            if full_match is True:
+                fn = re.fullmatch
+            else:
+                fn = re.match
+
+            if regexp.count(',') > 0:
+                _re = regexp.split(',')
+            elif regexp.count(' ') > 0:
+                _re = regexp.split()
+            else:
+                _re = [regexp]
+
+            lbls = self.colnames + tuple(self._aliases.keys())
+            _keys = []
+            for _rk in _re:
+                _keys += [k for k in lbls if (fn(_rk, k) is not None)]
+
+            return _keys
+        elif hasattr(regexp, '__iter__'):
+            _keys = []
+            for k in regexp:
+                _keys += self.keys(k)
+            return _keys
+        else:
+            raise ValueError('Unexpected type {0} for regexp'.format(type(regexp)))
 
     @property
     def name(self):
+        """ name of the table given by the Header['NAME'] attribute """
         return self.header.get('NAME', None)
 
     @property
     def colnames(self):
+        """ Sequence of column names """
         return self.data.dtype.names
 
     @property
     def ncols(self):
+        """ number of columns """
         return len(self.colnames)
 
     @property
     def nrows(self):
+        """ number of lines """
         return len(self.data)
 
     @property
     def nbytes(self):
-        """ return the number of bytes of the object """
+        """ number of bytes of the object """
         n = sum(k.nbytes if hasattr(k, 'nbytes') else sys.getsizeof(k)
                 for k in self.__dict__.values())
         return n
 
     def __len__(self):
+        """ number of lines """
         return self.nrows
 
     @property
     def shape(self):
+        """ shape of the data """
         return self.data.shape
 
     @property
     def dtype(self):
+        """ dtype of the data """
         return self.data.dtype
 
     def __getitem__(self, v):
         return np.asarray(self.data.__getitem__(self.resolve_alias(v)))
+
+    def get(self, v, full_match=False):
+        """ returns a table from columns given as v
+
+        this function is equivalent to :func:`__getitem__` but preserve the
+        Table format and associated properties (units, description, header)
+
+        Parameters
+        ----------
+        v: str
+            pattern to filter the keys with
+
+        full_match: bool
+            if set, use :func:`re.fullmatch` instead of :func:`re.match`
+
+        """
+        new_keys = self.keys(v)
+        t = self.__class__(self[new_keys])
+        t.header.update(**self.header)
+        t._aliases.update((k, v) for (k, v) in self._aliases.items() if v in new_keys)
+        t._units.update((k, v) for (k, v) in self._units.items() if v in new_keys)
+        t._desc.update((k, v) for (k, v) in self._desc.items() if v in new_keys)
+        return t
 
     def __setitem__(self, k, v):
         if k in self:
@@ -818,10 +1809,12 @@ class SimpleTable(object):
         return self.data.__iter__()
 
     def iterkeys(self):
-        for k in self.keys():
+        """ Iterator over the columns of the table """
+        for k in self.colnames:
             yield k
 
     def itervalues(self):
+        """ Iterator over the lines of the table """
         for l in self.data:
             yield l
 
@@ -838,9 +1831,9 @@ class SimpleTable(object):
             s += fmt.format(k, v)
 
         vals = [(k, self._units.get(k, ''), self._desc.get(k, ''))
-                for k in self.keys()]
+                for k in self.colnames]
         lengths = [(len(k), len(self._units.get(k, '')), len(self._desc.get(k, '')))
-                   for k in self.keys()]
+                   for k in self.colnames]
         lengths = list(map(max, (zip(*lengths))))
 
         s += '\nColumns:\n'
@@ -866,7 +1859,7 @@ class SimpleTable(object):
         return self.data.__getslice__(i, j)
 
     def __contains__(self, k):
-        return (k in self.keys()) or (k in self._aliases)
+        return (k in self.colnames) or (k in self._aliases)
 
     def __array__(self):
         return self.data
@@ -983,7 +1976,7 @@ class SimpleTable(object):
               constructed by filling the fields with the selected entries.
               Matching is not preserved if there are some duplicates...
         """
-        arr = recfunctions.join_by(key, self, r2, jointype=jointype,
+        arr = recfunctions.join_by(key, self.data, r2.data, jointype=jointype,
                                    r1postfix=r1postfix, r2postfix=r2postfix,
                                    defaults=defaults, usemask=False,
                                    asrecarray=True)
@@ -1149,7 +2142,7 @@ class SimpleTable(object):
             array of the result
         """
         _globals = {}
-        for k in ( list(self.keys()) + list(self._aliases.keys()) ):
+        for k in ( list(self.colnames) + list(self._aliases.keys()) ):
             if k in expr:
                 _globals[k] = self[k]
 
@@ -1181,7 +2174,7 @@ class SimpleTable(object):
         Returns
         -------
         out: ndarray/ tuple of ndarrays
-            result equivalent to numpy.where
+        result equivalent to :func:`np.where`
 
         """
         ind = np.where(self.evalexpr(condition, condvars, dtype=bool ), *args, **kwargs)
@@ -1190,15 +2183,23 @@ class SimpleTable(object):
     def select(self, fields, indices=None, **kwargs):
         """
         Select only a few fields in the table
-        """
-        if fields.count(',') > 0:
-            _fields = fields.split(',')
-        elif fields.count(' ') > 0:
-            _fields = fields.split()
-        else:
-            _fields = fields
 
-        if _fields == '*':
+        Parameters
+        ----------
+        fields: str or sequence
+            fields to keep in the resulting table
+
+        indices: sequence or slice
+            extract only on these indices
+
+        returns
+        -------
+        tab: SimpleTable instance
+            resulting table
+        """
+        _fields = self.keys(fields)
+
+        if fields == '*':
             if indices is None:
                 return self
             else:
@@ -1228,6 +2229,9 @@ class SimpleTable(object):
 
         Parameters
         ----------
+        fields: str or sequence
+            fields to keep in the resulting table
+
         condition: str
             expression to evaluate on the table
             includes mathematical operations and attribute names
@@ -1237,6 +2241,8 @@ class SimpleTable(object):
 
         Returns
         -------
+        tab: SimpleTable instance
+            resulting table
         """
         if condition in [True, 'True', None]:
             ind = None
@@ -1246,6 +2252,90 @@ class SimpleTable(object):
         tab = self.select(fields, indices=ind)
 
         return tab
+
+    def groupby(self, key):
+        """
+        Create an iterator which returns (key, sub-table) grouped by each value
+        of key(value)
+
+        Parameters
+        ----------
+        key: str
+            expression or pattern to filter the keys with
+
+        Returns
+        -------
+        key: str or sequence
+            group key
+
+        tab: SimpleTable instance
+           sub-table of the group
+           header, aliases and column metadata are preserved (linked to the
+           master table).
+        """
+        _key = self.keys(key)
+        getter = operator.itemgetter(*_key)
+
+        for k, grp in itertools.groupby(self.data, getter):
+            t = self.__class__(np.dstack(grp))
+            t.header = self.header
+            t._aliases = self._aliases
+            t._units = self._units
+            t._desc = self._desc
+            yield (k, t)
+
+    def stats(self, fn=None, fields=None, fill=None):
+        """ Make statistics on columns of a table
+
+        Paramters
+        ---------
+        fn: callable or sequence of callables
+            functions to apply to each column
+            default: (np.mean, np.std, np.nanmin, np.nanmax)
+
+        fields: str or sequence
+            any key or key expression to subselect columns
+            default is all columns
+
+        fill: value
+            value when not applicable
+            default np.nan
+
+        returns
+        -------
+        tab: Table instance
+            collection of statistics, one column per function in fn and 1 ligne
+            per column in the table
+        """
+        from collections import OrderedDict
+
+        fn = (stats.mean, stats.std,
+              stats.min, stats.max,
+              stats.has_nan)
+
+        d = OrderedDict()
+        d.setdefault('FIELD', [])
+        for k in fn:
+            d.setdefault(k.__name__, [])
+
+        if fields is None:
+            fields = self.colnames
+        else:
+            fields = self.keys(fields)
+
+        if fill is None:
+            fill = np.nan
+
+        for k in fields:
+            d['FIELD'].append(k)
+            for fnk in fn:
+                try:
+                    val = fnk(self[k])
+                except:
+                    val = fill
+                d[fnk.__name__].append(val)
+
+        return self.__class__(d, dtype=dict)
 
     # method aliases
     remove_column = remove_columns
@@ -1258,9 +2348,322 @@ class SimpleTable(object):
     delCol = remove_columns
 
 
+class AstroTable(SimpleTable):
+    """
+    Derived from the Table, this class add implementations of common astro
+    tools especially conesearch
+    """
+    def __init__(self, *args, **kwargs):
+        super(self.__class__, self).__init__(*args, **kwargs)
+        self._ra_name, self._dec_name = self.__autoRADEC__()
+        if (len(args) > 0):
+            if isinstance(args[0], AstroTable):
+                self._ra_name = args[0]._ra_name
+                self._dec_name = args[0]._dec_name
+        self._ra_name = kwargs.get('ra_name', self._ra_name)
+        self._dec_name = kwargs.get('dec_name', self._dec_name)
+
+    def __autoRADEC__(self):
+        """ Tries to identify the columns containing RA and DEC coordinates """
+        if 'ra' in self:
+            ra_name = 'ra'
+        elif 'RA' in self:
+            ra_name = 'RA'
+        else:
+            ra_name = None
+        if 'dec' in self:
+            dec_name = 'dec'
+        elif 'DEC' in self:
+            dec_name = 'DEC'
+        else:
+            dec_name = None
+        return ra_name, dec_name
+
+    def set_RA(self, val):
+        """ Set the column that defines RA coordinates """
+        assert(val in self), 'column name {} not found in the table'.format(val)
+        self._ra_name = val
+
+    def set_DEC(self, val):
+        """ Set the column that defines DEC coordinates """
+        assert(val in self), 'column name {} not found in the table'.format(val)
+        self._dec_name = val
+
+    def get_RA(self, degree=True):
+        """ Returns RA, converted from hexa/sexa into degrees """
+        if self._ra_name is None:
+            return None
+        if (not degree) or (self.dtype[self._ra_name].kind != 'S'):
+            return self[self._ra_name]
+        else:
+            if (len(str(self[0][self._ra_name]).split(':')) == 3):
+                return np.asarray(AstroHelpers.hms2deg(self[self._ra_name],
+                                                       delim=':'))
+            elif (len(str(self[0][self._ra_name]).split(' ')) == 3):
+                return np.asarray(AstroHelpers.hms2deg(self[self._ra_name],
+                                                       delim=' '))
+            else:
+                raise Exception('RA Format not understood')
+
+    def get_DEC(self, degree=True):
+        """ Returns RA, converted from hexa/sexa into degrees """
+        if self._dec_name is None:
+            return None
+        if (not degree) or (self.dtype[self._dec_name].kind != 'S'):
+            return self[self._dec_name]
+        else:
+            if (len(str(self[0][self._dec_name]).split(':')) == 3):
+                return np.asarray(AstroHelpers.dms2deg(self[self._dec_name],
+                                                       delim=':'))
+            elif (len(str(self[0][self._dec_name]).split(' ')) == 3):
+                return np.asarray(AstroHelpers.dms2deg(self[self._dec_name],
+                                                       delim=' '))
+            else:
+                raise Exception('RA Format not understood')
+
+    def info(self):
+        s = "\nTable: {name:s}\n       nrows={s.nrows:d}, ncols={s.ncols:d}, mem={size:s}"
+        s = s.format(name=self.header.get('NAME', 'Noname'), s=self,
+                     size=pretty_size_print(self.nbytes))
+
+        s += '\n\nHeader:\n'
+        vals = list(self.header.items())
+        length = max(map(len, self.header.keys()))
+        fmt = '\t{{0:{0:d}s}} {{1}}\n'.format(length)
+        for k, v in vals:
+            s += fmt.format(k, v)
+
+        vals = [(k, self._units.get(k, ''), self._desc.get(k, ''))
+                for k in self.colnames]
+        lengths = [(len(k), len(self._units.get(k, '')), len(self._desc.get(k, '')))
+                   for k in self.colnames]
+        lengths = list(map(max, (zip(*lengths))))
+
+        if (self._ra_name is not None) & (self._dec_name is not None):
+            s += "\nPosition coordinate columns: {0}, {1}\n".format(self._ra_name,
+                                                                    self._dec_name)
+
+        s += '\nColumns:\n'
+
+        fmt = '\t{{0:{0:d}s}} {{1:{1:d}s}} {{2:{2:d}s}}\n'.format(*(k + 1 for k in lengths))
+        for k, u, c in vals:
+            s += fmt.format(k, u, c)
+
+        print(s)
+
+        if len(self._aliases) > 0:
+            print("\nTable contains alias(es):")
+            for k, v in self._aliases.items():
+                print('\t{0:s} --> {1:s}'.format(k, v))
+
+    def coneSearch(self, ra, dec, r, outtype=0):
+        """ Perform a cone search on a table
+
+        Parameters
+        ----------
+        ra0: ndarray[ndim=1, dtype=float]
+            column name to use as RA source in degrees
+
+        dec0: ndarray[ndim=1, dtype=float]
+            column name to use as DEC source in degrees
+
+        ra: float
+            ra to look for (in degree)
+
+        dec: float
+            ra to look for (in degree)
+
+        r: float
+            distance in degrees
+
+        outtype: int
+            type of outputs
+                0 -- minimal, indices of matching coordinates
+                1 -- indices and distances of matching coordinates
+                2 -- full, boolean filter and distances
+
+        Returns
+        -------
+        t: tuple
+            if outtype is 0:
+                only return indices from ra0, dec0
+            elif outtype is 1:
+                return indices from ra0, dec0 and distances
+            elif outtype is 2:
+                return conditional vector and distance to all ra0, dec0
+        """
+        if (self._ra_name is None) or (self._dec_name is None):
+            raise AttributeError('Coordinate columns not set.')
+
+        ra0  = self.get_RA()
+        dec0 = self.get_DEC()
+        return AstroHelpers.conesearch(ra0, dec0, ra, dec, r, outtype=outtype)
+
+    def zoneSearch(self, ramin, ramax, decmin, decmax, outtype=0):
+        """ Perform a zone search on a table, i.e., a rectangular selection
+        Parameters
+        ----------
+        ramin: float
+            minimal value of RA
+
+        ramax: float
+            maximal value of RA
+
+        decmin: float
+            minimal value of DEC
+
+        decmax: float
+            maximal value of DEC
+
+        outtype: int
+            type of outputs
+                0 or 1 -- minimal, indices of matching coordinates
+                2 -- full, boolean filter and distances
+
+        Returns
+        -------
+        r: sequence
+            indices or conditional sequence of matching values
+        """
+
+        assert( (self._ra_name is not None) & (self._dec_name is not None) ), 'Coordinate columns not set.'
+
+        ra0  = self.get_RA()
+        dec0 = self.get_DEC()
+        ind = (ra0 >= ramin) & (ra0 <= ramax) & (dec0 >= decmin) & (dec0 <= decmax)
+        if outtype <= 2:
+            return ind
+        else:
+            return np.where(ind)
+
+    def where(self, condition=None, condvars=None, cone=None, zone=None, **kwargs):
+        """ Read table data fulfilling the given `condition`.
+        Only the rows fulfilling the `condition` are included in the result.
+
+        Parameters
+        ----------
+        condition: str
+            expression to evaluate on the table
+            includes mathematical operations and attribute names
+
+        condvars: dictionary, optional
+            A dictionary that replaces the local operands in current frame.
+
+        Returns
+        -------
+        out: ndarray/ tuple of ndarrays
+        result equivalent to :func:`np.where`
+        """
+        if cone is not None:
+            if len(cone) != 3:
+                raise ValueError('Expecting cone keywords as a triplet (ra, dec, r)')
+        if zone is not None:
+            if len(zone) != 4:
+                raise ValueError('Expecting zone keywords as a tuple of 4 elements (ramin, ramax, decmin, decmax)')
+
+        if condition is not None:
+            ind = super(self.__class__, self).where(condition, **kwargs)
+            if ind is None:
+                if (cone is None) & (zone is None):
+                    return None
+        else:
+            ind = True
+
+        blobs = []
+        if (cone is not None):
+            ra, dec, r = cone
+            _ind, d = self.coneSearch(ra, dec, r, outtype=1)
+            ind = ind & _ind.astype(bool)
+            blobs.append(d)
+        if (zone is not None):
+            _ind = self.zoneSearch(zone[0], zone[1], zone[2], zone[3], outtype=1)
+            ind = ind & _ind
+        elif (cone is not None) and (zone is not None):  # cone + zone
+            ra, dec, r = cone
+            ind, d = self.coneSearch(ra, dec, r, outtype=2)
+            ind = ind & self.zoneSearch(zone[0], zone[1], zone[2], zone[3], outtype=2)
+            d = d[ind]
+            ind = np.where(ind)
+            blobs.append(d)
+
+        return ind, blobs[0]
+
+    def selectWhere(self, fields, condition=None, condvars=None, cone=None, zone=None, **kwargs):
+        """ Read table data fulfilling the given `condition`.
+            Only the rows fulfilling the `condition` are included in the result.
+            conesearch is also possible through the keyword cone formatted as (ra, dec, r)
+            zonesearch is also possible through the keyword zone formatted as (ramin, ramax, decmin, decmax)
+
+            Combination of multiple selections is also available.
+        """
+        ind, blobs = self.where(condition, condvars, cone, zone, **kwargs)
+        tab = self.select(fields, indices=ind)
+
+        if cone is not None:
+            tab.add_column('separation', np.asarray(blobs), unit='degree')
+
+        if self._ra_name in tab:
+            tab.set_RA(self._ra_name)
+
+        if self._dec_name in tab:
+            tab.set_DEC(self._dec_name)
+
+        return tab
+
+
+class stats(object):
+    @classmethod
+    def has_nan(s, v):
+        return (True in np.isnan(v))
+
+    @classmethod
+    def mean(s, v):
+        return np.nanmean(v)
+
+    @classmethod
+    def max(s, v):
+        return np.nanmax(v)
+
+    @classmethod
+    def min(s, v):
+        return np.nanmin(v)
+
+    @classmethod
+    def std(s, v):
+        return np.nanstd(v)
+
+    @classmethod
+    def var(s, v):
+        return np.var(v)
+
+    @classmethod
+    def p16(s, v):
+        try:
+            return np.nanpercentile(v, 16)
+        except AttributeError:
+            return np.percentile(v, 16)
+
+    @classmethod
+    def p84(s, v):
+        try:
+            return np.nanpercentile(v, 84)
+        except AttributeError:
+            return np.percentile(v, 84)
+
+    @classmethod
+    def p50(s, v):
+        try:
+            return np.nanmedian(v)
+        except AttributeError:
+            return np.percentile(v, 50)
+
+
+# =============================================================================
+# Adding some plotting functions
+# =============================================================================
+
 try:
     import pylab as plt
-    from functools import wraps
 
     def plot_function(tab, fn, *args, **kwargs):
         """ Generate a plotting method of tab from a given function
@@ -1328,11 +2731,17 @@ try:
 
         return _fn(*_args, **kwargs)
 
-    def attached_function(fn, doc=None):
+    def attached_function(fn, doc=None, errorlevel=0):
+        """ eclare a function as a method to the class table"""
 
-        @wraps(fn)
         def _fn(self, *args, **kwargs):
-            return plot_function(self, fn, *args, **kwargs)
+            try:
+                return plot_function(self, fn, *args, **kwargs)
+            except Exception as e:
+                if errorlevel < 1:
+                    pass
+                else:
+                    raise e
 
         if doc is not None:
             _fn.__doc__ = doc
@@ -1345,9 +2754,12 @@ try:
     SimpleTable.hist2d = attached_function('hist2d', plt.hist2d.__doc__)
     SimpleTable.hexbin = attached_function('hexbin', plt.hexbin.__doc__)
     SimpleTable.scatter = attached_function('scatter', plt.scatter.__doc__)
-    SimpleTable.violinplot = attached_function('violinplot', plt.violinplot.__doc__)
-    SimpleTable.boxplot = attached_function('boxplot', plt.boxplot.__doc__)
+
+    # newer version of matplotlib
+    if hasattr(plt, 'violinplot'):
+        SimpleTable.violinplot = attached_function('violinplot', plt.violinplot.__doc__)
+    if hasattr(plt, 'boxplot'):
+        SimpleTable.boxplot = attached_function('boxplot', plt.boxplot.__doc__)
 
 except Exception as e:
     print(e)
-    pass
