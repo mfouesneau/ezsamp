@@ -46,6 +46,7 @@ from functools import wraps, partial
 import numpy as np
 from numpy import deg2rad, rad2deg, sin, cos, sqrt, arcsin, arctan2
 from numpy.lib import recfunctions
+import types
 
 try:
     from astropy.io import fits as pyfits
@@ -58,6 +59,12 @@ try:
     import tables
 except ImportError:
     tables = None
+
+try:
+    import pandas as _pd
+except ImportError:
+    _pd = None
+
 
 # ==============================================================================
 # Python 3 compatibility behavior
@@ -536,6 +543,7 @@ def _hdf5_write_data(filename, data, tablename=None, mode='w', append=False,
 
     if append is True:
         mode = 'a'
+    silent = kwargs.pop('silent', False)
 
     if isinstance(filename, tables.File):
         if (filename.mode != mode) & (mode != 'r'):
@@ -563,7 +571,8 @@ def _hdf5_write_data(filename, data, tablename=None, mode='w', append=False,
             t.append(data.astype(t.description._v_dtype))
             t.flush()
         except tables.NoSuchNodeError:
-            print(("Warning: Table {0} does not exists.  \n A new table will be created").format(where + name))
+            if not silent:
+                print(("Warning: Table {0} does not exists.  \n A new table will be created").format(where + name))
             append = False
 
     if not append:
@@ -797,21 +806,42 @@ def _convert_dict_to_structured_ndarray(data):
         structured numpy array
     """
     newdtype = []
-    for key, dk in iteritems(data):
-        _dk = np.asarray(dk)
-        dtype = _dk.dtype
-        # unknown type is converted to text
-        if dtype.type == np.object_:
-            if len(data) == 0:
-                longest = 0
+    try:
+        for key, dk in iteritems(data):
+            _dk = np.asarray(dk)
+            dtype = _dk.dtype
+            # unknown type is converted to text
+            if dtype.type == np.object_:
+                if len(data) == 0:
+                    longest = 0
+                else:
+                    longest = len(max(_dk, key=len))
+                    _dk = _dk.astype('|%iS' % longest)
+            if _dk.ndim > 1:
+                newdtype.append((str(key), _dk.dtype, (_dk.shape[1],)))
             else:
-                longest = len(max(_dk, key=len))
-                _dk = _dk.astype('|%iS' % longest)
-        if _dk.ndim > 1:
-            newdtype.append((str(key), _dk.dtype, (_dk.shape[1],)))
-        else:
-            newdtype.append((str(key), _dk.dtype))
-    tab = np.rec.fromarrays(itervalues(data), dtype=newdtype)
+                newdtype.append((str(key), _dk.dtype))
+        tab = np.rec.fromarrays(itervalues(data), dtype=newdtype)
+    except AttributeError:  # not a dict
+        # hope it's a tuple ((key, value),) pairs.
+        from itertools import tee
+        d1, d2 = tee(data)
+        for key, dk in d1:
+            _dk = np.asarray(dk)
+            dtype = _dk.dtype
+            # unknown type is converted to text
+            if dtype.type == np.object_:
+                if len(data) == 0:
+                    longest = 0
+                else:
+                    longest = len(max(_dk, key=len))
+                    _dk = _dk.astype('|%iS' % longest)
+            if _dk.ndim > 1:
+                newdtype.append((str(key), _dk.dtype, (_dk.shape[1],)))
+            else:
+                newdtype.append((str(key), _dk.dtype))
+        tab = np.rec.fromarrays((dk for (_, dk) in d2), dtype=newdtype)
+
     return tab
 
 
@@ -1346,35 +1376,50 @@ class SimpleTable(object):
         self._units = kwargs.get('units', {})
         self._desc = kwargs.get('desc', {})
 
-        if (type(fname) == dict) or (dtype in [dict, 'dict']):
-            self.header = fname.pop('header', {})
+        if (isinstance(fname, (dict, tuple, list, types.GeneratorType))) or (dtype in [dict, 'dict']):
+            try:
+                self.header = fname.pop('header', {})
+            except (AttributeError, TypeError):
+                self.header = kwargs.pop('header', {})
             self.data = _convert_dict_to_structured_ndarray(fname)
-        elif (type(fname) in basestring) or (dtype is not None):
-            if (type(fname) in basestring):
+        elif (type(fname) in (str,)) or (dtype is not None):
+            if (type(fname) in (str,)):
                 extension = fname.split('.')[-1]
             else:
                 extension = None
             if (extension == 'csv') or dtype == 'csv':
                 kwargs.setdefault('delimiter', ',')
-                kwargs.setdefault('comments', '#')
                 commentedHeader = kwargs.pop('commentedHeader', False)
                 n, header, units, comments, aliases, names = _ascii_read_header(fname, commentedHeader=commentedHeader, **kwargs)
                 kwargs.setdefault('names', names)
-                kwargs.setdefault('skip_header', n)
-                self.data = np.recfromcsv(fname, *args, **kwargs)
+                if _pd is not None:   # pandas is faster
+                    kwargs.setdefault('comment', '#')
+                    kwargs.setdefault('as_recarray', True)
+                    kwargs.setdefault('skiprows', n)
+                    self.data = _pd.read_csv(fname, *args, **kwargs)
+                else:
+                    kwargs.setdefault('skip_header', n)
+                    kwargs.setdefault('comments', '#')
+                    self.data = np.recfromcsv(fname, *args, **kwargs)
                 self.header = header
                 self._units.update(**units)
                 self._desc.update(**comments)
                 self._aliases.update(**aliases)
                 kwargs.setdefault('names', True)
             elif (extension in ('tsv', 'dat', 'txt')) or dtype in ('tsv', 'dat', 'txt'):
-                kwargs.setdefault('delimiter', None)
-                kwargs.setdefault('comments', '#')
                 commentedHeader = kwargs.pop('commentedHeader', True)
                 n, header, units, comments, aliases, names = _ascii_read_header(fname, commentedHeader=commentedHeader, **kwargs)
                 kwargs.setdefault('names', names)
-                kwargs.setdefault('skip_header', n)
-                self.data = np.recfromtxt(fname, *args, **kwargs)
+                if _pd is not None:   # pandas is faster
+                    kwargs.setdefault('delimiter', '\s+')
+                    kwargs.setdefault('comment', '#')
+                    kwargs.setdefault('as_recarray', True)
+                    self.data = _pd.read_csv(fname, *args, **kwargs)
+                else:
+                    kwargs.setdefault('delimiter', None)
+                    kwargs.setdefault('comments', '#')
+                    kwargs.setdefault('skip_header', n)
+                    self.data = np.recfromtxt(fname, *args, **kwargs)
                 self.header = header
                 self._units.update(**units)
                 self._desc.update(**comments)
@@ -1559,14 +1604,17 @@ class SimpleTable(object):
             :func:`pyfits.writeto` or :func:`pyfits.append`
             :func:`np.savetxt`
         """
-        extension = fname.split('.')[-1]
+        extension = kwargs.pop('extension', None)
+        if extension is None:
+            extension = fname.split('.')[-1]
         if (extension == 'csv'):
             comments = kwargs.pop('comments', '#')
             delimiter = kwargs.pop('delimiter', ',')
             commentedHeader = kwargs.pop('commentedHeader', False)
             hdr = _ascii_generate_header(self, comments=comments, delimiter=delimiter,
                                          commentedHeader=commentedHeader)
-            np.savetxt(fname, self.data, delimiter=delimiter, header=hdr,
+            header = kwargs.pop('header', hdr)
+            np.savetxt(fname, self.data, delimiter=delimiter, header=header,
                        comments='', **kwargs)
         elif (extension in ['txt', 'dat']):
             comments = kwargs.pop('comments', '#')
@@ -1574,7 +1622,8 @@ class SimpleTable(object):
             commentedHeader = kwargs.pop('commentedHeader', True)
             hdr = _ascii_generate_header(self, comments=comments, delimiter=delimiter,
                                          commentedHeader=commentedHeader)
-            np.savetxt(fname, self.data, delimiter=delimiter, header=hdr,
+            header = kwargs.pop('header', hdr)
+            np.savetxt(fname, self.data, delimiter=delimiter, header=header,
                        comments='', **kwargs)
         elif (extension == 'fits'):
             hdr0 = kwargs.pop('header', None)
@@ -1806,7 +1855,11 @@ class SimpleTable(object):
             return object.__getattribute__(self, k)
 
     def __iter__(self):
-        return self.data.__iter__()
+        newtab = self.select('*', [0])
+        for d in self.data:
+            newtab.data[0] = d
+            yield newtab
+        # return self.data.__iter__()
 
     def iterkeys(self):
         """ Iterator over the columns of the table """
@@ -1913,6 +1966,7 @@ class SimpleTable(object):
         """
         return np.where( np.equal.outer( self[key], r2[key] ) )
 
+    '''
     def stack(self, r, defaults=None):
         """
         Superposes arrays fields by fields inplace
@@ -1925,6 +1979,33 @@ class SimpleTable(object):
             raise AttributeError('r should be a Table object')
         self.data = recfunctions.stack_arrays([self.data, r.data], defaults,
                                               usemask=False, asrecarray=True)
+    '''
+
+    def stack(self, r, *args, **kwargs):
+        """
+        Superposes arrays fields by fields inplace
+
+        t.stack(t1, t2, t3, default=None, inplace=True)
+
+        Parameters
+        ----------
+        r: Table
+        """
+        if not hasattr(r, 'data'):
+            raise AttributeError('r should be a Table object')
+        defaults = kwargs.get('defaults', None)
+        inplace = kwargs.get('inplace', False)
+
+        data = [self.data, r.data] + [k.data for k in args]
+        sdata = recfunctions.stack_arrays(data, defaults, usemask=False,
+                                          asrecarray=True)
+
+        if inplace:
+            self.data = sdata
+        else:
+            t = self.__class__(self)
+            t.data = sdata
+            return t
 
     def join_by(self, r2, key, jointype='inner', r1postfix='1', r2postfix='2',
                 defaults=None, asrecarray=False, asTable=True):
